@@ -86,16 +86,16 @@ def generate_image(page_text: str, page_number: int, overall_prompt: str, refere
             image_prompt = f"""
             Children's book illustration. Use the same art style, color palette, and visual aesthetic as the reference image provided.
             Scene from a story about {overall_prompt}.
-            This is page {page_number} of the book.
+            This is page {page_number} of the book. Put the page number in the bottom right corner of the image.
             Page content: {page_text}
             
-            IMPORTANT: Match the artistic style, character design, colors, and overall look of the reference image exactly.
+            IMPORTANT: Match the artistic style, character design, colors, and overall look of the reference image.
             """
         else:
             image_prompt = f"""
             Children's book illustration style, colorful and friendly
             Scene from a story about {overall_prompt}.
-            This is page {page_number} of the book.
+            This is page {page_number} of the book. Put the page number in the bottom right corner of the image.
             Page content: {page_text}
             """
 
