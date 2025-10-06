@@ -114,6 +114,10 @@ Each generated book includes a `book_data.json` file with the following structur
 - Ensure you have sufficient credits in your OpenRouter account
 - The app uses OpenRouter's API for both text and image generation
 
+## Acknowledgements
+
+- Dex
+
 ## License
 
 MIT License - Feel free to modify and use as needed!
