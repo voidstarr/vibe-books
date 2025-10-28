@@ -8,6 +8,9 @@ import requests
 from dotenv import load_dotenv
 import json
 from datetime import datetime
+import concurrent.futures
+import tempfile
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -17,6 +20,11 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
+
+# Allow overriding models via environment variables for faster alternatives
+# Set OPENROUTER_TEXT_MODEL and OPENROUTER_IMAGE_MODEL in your .env to change
+TEXT_MODEL = os.getenv("OPENROUTER_TEXT_MODEL", "google/gemini-2.5-flash-preview-09-2025")
+IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "google/gemini-2.5-flash-image-preview")
 
 
 def image_to_base64_data_url(img: Image.Image) -> str:
@@ -41,7 +49,7 @@ Format your response as exactly 10 pages, numbered 1-10, with each page on its o
 
     try:
         response = client.chat.completions.create(
-            model="google/gemini-2.5-flash-preview-09-2025",
+            model=TEXT_MODEL,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": f"Write a 10-page children's story about: {prompt}"}
@@ -132,7 +140,7 @@ def generate_image(page_text: str, page_number: int, overall_prompt: str, refere
 
         # Use chat completions endpoint with modalities for image generation
         response = client.chat.completions.create(
-            model="google/gemini-2.5-flash-image-preview",
+            model=IMAGE_MODEL,
             messages=messages,
             modalities=["image", "text"]
         )
@@ -140,24 +148,77 @@ def generate_image(page_text: str, page_number: int, overall_prompt: str, refere
         # Extract the image from the response
         message = response.choices[0].message
 
-        if 'images' in message.model_extra and message.model_extra['images']:
-            # Get the base64 data URL from the first image
-            image_data_url = message.model_extra['images'][0]['image_url']['url']
+        # Validate structure
+        if not (hasattr(message, 'model_extra') and isinstance(message.model_extra, dict)):
+            raise Exception("No model_extra in image response")
 
-            # Check if it's a base64 data URL
-            if image_data_url.startswith('data:image'):
-                # Extract the base64 data (remove the data:image/png;base64, prefix)
+        images_meta = message.model_extra.get('images') if isinstance(message.model_extra, dict) else None
+        if not images_meta:
+            raise Exception("No images in response")
+
+        # Get the first image entry safely
+        image_entry = images_meta[0]
+        # Support either 'image_url' key or a direct url field
+        image_data_url = None
+        if isinstance(image_entry, dict):
+            image_url_field = image_entry.get('image_url') or image_entry.get('url')
+            if isinstance(image_url_field, dict):
+                image_data_url = image_url_field.get('url')
+            else:
+                image_data_url = image_url_field
+
+        if not image_data_url:
+            raise Exception("No image URL/data found in response entry")
+
+        # Helper to write debug bytes when decoding fails
+        def _save_debug(bytes_blob: bytes, suffix: str = '.bin') -> str:
+            try:
+                fd, path = tempfile.mkstemp(prefix=f"vibe_image_debug_p{page_number}_", suffix=suffix, dir='.')
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(bytes_blob)
+                print(f"Saved debug image bytes to: {path}")
+                return path
+            except Exception as e:
+                print(f"Failed to save debug file: {e}")
+                return '<failed-to-save>'
+
+        # If it's a data URL, decode and open
+        if isinstance(image_data_url, str) and image_data_url.startswith('data:image'):
+            try:
                 base64_data = image_data_url.split(',', 1)[1]
                 image_bytes = base64.b64decode(base64_data)
+            except Exception as e:
+                print(f"Failed to decode base64 image for page {page_number}: {e}")
+                _save_debug(image_data_url.encode('utf-8'), suffix='.txt')
+                raise
+
+            try:
                 img = Image.open(io.BytesIO(image_bytes))
+                img.load()
                 return img
-            else:
-                # If it's a URL, download it
-                img_response = requests.get(image_data_url)
-                img = Image.open(io.BytesIO(img_response.content))
-                return img
+            except Exception as e:
+                print(f"PIL failed to open decoded image bytes for page {page_number}: {e}")
+                _save_debug(image_bytes, suffix='.bin')
+                raise
         else:
-            raise Exception("No images in response")
+            # Otherwise treat it as a URL and download it
+            try:
+                img_response = requests.get(image_data_url, timeout=30)
+                img_response.raise_for_status()
+                content = img_response.content
+            except Exception as e:
+                print(f"Failed to download image URL for page {page_number}: {e}")
+                raise
+
+            try:
+                img = Image.open(io.BytesIO(content))
+                img.load()
+                return img
+            except Exception as e:
+                print(f"PIL failed to open downloaded image for page {page_number}: {e}")
+                dbg = _save_debug(content, suffix='.bin')
+                print(f"Wrote failing image bytes to {dbg} for inspection")
+                raise
 
     except Exception as e:
         print(f"Error generating image for page {page_number}: {str(e)}")
@@ -230,23 +291,54 @@ def generate_childrens_book(prompt: str, progress=gr.Progress()):
     storyboard = []
     images = []
     reference_image = None  # Will store the first image for style consistency
+    # Generate the first image serially to establish the reference style
+    try:
+        progress(0.05, desc=f"Generating image for page 1/10 (establishing style)...")
+        first_image = generate_image(pages[0], 1, prompt, None)
+    except Exception as e:
+        print(f"Error generating first image: {e}")
+        first_image = Image.new('RGB', (512, 512), color='lightgray')
 
-    for i, page_text in enumerate(pages):
-        if i == 0:
-            progress(
-                (i + 1) / 10, desc=f"Generating image for page {i + 1}/10 (establishing style)...")
-        else:
-            progress(
-                (i + 1) / 10, desc=f"Generating image for page {i + 1}/10 (matching style)...")
+    storyboard = [(first_image, pages[0])]
+    images = [first_image]
+    reference_image = first_image
 
-        # Pass reference_image to all generations after the first
-        image = generate_image(page_text, i + 1, prompt, reference_image)
-        storyboard.append((image, page_text))
-        images.append(image)
+    # Parallelize generation for the remaining pages (2..N)
+    remaining_count = max(0, len(pages) - 1)
+    if remaining_count > 0:
+        # Tune max_workers as needed; keep it modest to avoid request throttling
+        max_workers = min(4, remaining_count)
 
-        # Store the first image as the style reference
-        if i == 0:
-            reference_image = image
+        # Prepare placeholders so we can place images into the correct order
+        images += [None] * remaining_count
+        storyboard += [(None, pages[i]) for i in range(1, len(pages))]
+
+        # Map futures to page indexes (1-based page numbers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for idx in range(1, len(pages)):
+                page_num = idx + 1
+                page_text = pages[idx]
+                # Submit generation task using the established reference image
+                fut = executor.submit(generate_image, page_text, page_num, prompt, reference_image)
+                futures[fut] = idx
+
+            completed = 0
+            for fut in concurrent.futures.as_completed(futures):
+                idx = futures[fut]
+                page_num = idx + 1
+                try:
+                    img = fut.result()
+                except Exception as e:
+                    print(f"Error generating image for page {page_num}: {e}")
+                    img = Image.new('RGB', (512, 512), color='lightgray')
+
+                # Place image and storyboard in correct slot
+                images[idx] = img
+                storyboard[idx] = (img, pages[idx])
+
+                completed += 1
+                progress(0.05 + (completed / len(pages)) * 0.9, desc=f"Generating images... ({completed}/{remaining_count})")
 
     progress(1.0, desc="Saving book to folder...")
 
